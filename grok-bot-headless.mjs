@@ -240,11 +240,13 @@ function asarLookup(header, entry) {
 }
 
 function readAsarFile(archive, entry) {
-  const { fd, jsonSize, header } = loadAsarHeader(archive);
+  const { fd, header } = loadAsarHeader(archive);
   try {
     const node = asarLookup(header, entry);
     if (!node || typeof node.size !== 'number') throw new Error(`Cannot resolve ${entry}`);
-    return readExact(fd, node.size, 16 + jsonSize + Number(node.offset));
+    // File bytes follow the header pickle, including its 4-byte alignment padding.
+    const headerPickleSize = readExact(fd, 8, 0).readUInt32LE(4);
+    return readExact(fd, node.size, 8 + headerPickleSize + Number(node.offset));
   } finally {
     closeSync(fd);
   }

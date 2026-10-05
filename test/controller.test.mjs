@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { closeSync, mkdtempSync, openSync, readSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
@@ -41,6 +41,50 @@ function writeAsar(archivePath, files) {
   header.writeUInt32LE(json.length + 4, 8);
   header.writeUInt32LE(json.length, 12);
   writeFileSync(archivePath, Buffer.concat([header, json, ...blobs]));
+}
+
+function writePickleAsar(archivePath, files) {
+  const tree = { files: {} };
+  const blobs = [];
+  let offset = 0;
+  for (const [path, content] of Object.entries(files)) {
+    const buf = Buffer.from(content);
+    let node = tree;
+    for (const part of path.split('/').slice(0, -1)) {
+      node.files[part] ??= { files: {} };
+      node = node.files[part];
+    }
+    node.files[path.split('/').at(-1)] = { size: buf.length, offset: String(offset) };
+    blobs.push(buf);
+    offset += buf.length;
+  }
+  tree.align = '';
+  let json = Buffer.from(JSON.stringify(tree));
+  while (json.length % 4 !== 2) {
+    tree.align += 'x';
+    json = Buffer.from(JSON.stringify(tree));
+  }
+  const padding = (4 - (json.length % 4)) % 4;
+  const payloadSize = 4 + json.length + padding;
+  const headerPickleSize = 4 + payloadSize;
+  const header = Buffer.alloc(8 + headerPickleSize);
+  header.writeUInt32LE(4, 0);
+  header.writeUInt32LE(headerPickleSize, 4);
+  header.writeUInt32LE(payloadSize, 8);
+  header.writeUInt32LE(json.length, 12);
+  json.copy(header, 16);
+  writeFileSync(archivePath, Buffer.concat([header, ...blobs]));
+}
+
+function readAt(path, position, length) {
+  const fd = openSync(path, 'r');
+  try {
+    const buffer = Buffer.alloc(length);
+    readSync(fd, buffer, 0, length, position);
+    return buffer;
+  } finally {
+    closeSync(fd);
+  }
 }
 
 test('service URLs require HTTPS, drop trailing slashes, and reject embedded credentials', () => {
@@ -109,6 +153,46 @@ test('0.66.0 resolves dist/local-exec-daemon/main.cjs from the asar', () => {
       () => resolveDaemonEntry(`${missing}/${daemonEntry}`),
       /dist\/local-exec-daemon\/main\.cjs/,
     );
+
+    writeFileSync(join(directory, 'grok-bot'), '', { mode: 0o755 });
+    const output = execFileSync(process.execPath, [fileURLToPath(new URL('../grok-bot-headless.mjs', import.meta.url)), 'check', '--local'], {
+      encoding: 'utf8',
+      env: {
+        ...process.env,
+        GROK_BOT_BINARY: join(directory, 'grok-bot'),
+        GROK_BOT_DAEMON_SCRIPT: `${archive}/${daemonEntry}`,
+        GROK_BOT_PACKAGE_JSON: `${archive}/package.json`,
+      },
+    });
+    assert.deepEqual(JSON.parse(output), {
+      compatible: true,
+      installedVersion: '0.66.0',
+      testedVersion: true,
+      daemonEntryPoint: 'verified',
+      authentication: 'skipped',
+    });
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('0.66.0 version payload that starts with > then { still parses', () => {
+  const directory = mkdtempSync(join(tmpdir(), 'grok-bot-066-version-'));
+  try {
+    const archive = join(directory, 'app.asar');
+    const daemonEntry = 'dist/local-exec-daemon/main.cjs';
+    const packageJson = '{\n  "name": "sand",\n  "version": "0.66.0"\n}\n';
+    writePickleAsar(archive, {
+      'license.html': '</html>\n',
+      'package.json': packageJson,
+      [daemonEntry]: 'module.exports = {};\n',
+    });
+
+    const jsonSize = readAt(archive, 12, 4).readUInt32LE(0);
+    const packageOffset = Number(JSON.parse(readAt(archive, 16, jsonSize).toString()).files['package.json'].offset);
+    const naive = readAt(archive, 16 + jsonSize + packageOffset, 24);
+    assert.equal(String.fromCharCode(naive[0]), '>');
+    assert.equal(naive.subarray(1).includes(Buffer.from('{')), true, String(naive));
 
     writeFileSync(join(directory, 'grok-bot'), '', { mode: 0o755 });
     const output = execFileSync(process.execPath, [fileURLToPath(new URL('../grok-bot-headless.mjs', import.meta.url)), 'check', '--local'], {
