@@ -7,13 +7,13 @@ trap 'rm -rf "$test_root"' EXIT
 home_dir="$test_root/home"
 fake_dir="$test_root/fake"
 shim_dir="$test_root/bin"
-mkdir -p "$home_dir" "$fake_dir" "$shim_dir"
+mkdir -p "$home_dir" "$fake_dir/resources" "$shim_dir"
 printf '#!/usr/bin/env sh\nexit 0\n' > "$fake_dir/grok-bot"
 printf '#!/usr/bin/env sh\nexit 0\n' > "$shim_dir/systemctl"
 chmod 0755 "$fake_dir/grok-bot" "$shim_dir/systemctl"
-node --input-type=module - "$fake_dir/app.asar" <<'JS'
+node --input-type=module - "$fake_dir/resources/app.asar" <<'JS'
 import { writeFileSync } from 'node:fs';
-const archive = process.argv[1];
+const archive = process.argv[2];
 const files = {
   'package.json': Buffer.from('{"version":"0.66.0"}\n'),
   'dist/local-exec-daemon/main.cjs': Buffer.from('module.exports = {};\n'),
@@ -44,7 +44,7 @@ HOME="$home_dir" \
 USER=testuser \
 PATH="$shim_dir:$PATH" \
 GROK_BOT_BINARY="$fake_dir/grok-bot" \
-GROK_BOT_DAEMON_SCRIPT="$fake_dir/app.asar/dist/local-exec-daemon/main.cjs" \
+GROK_BOT_DAEMON_SCRIPT="$fake_dir/resources/app.asar/dist/local-exec-daemon/main.cjs" \
   "$repo_dir/install.sh"
 
 test -x "$home_dir/.local/bin/grok-bot-headless"
@@ -56,7 +56,7 @@ HOME="$home_dir" "$home_dir/.local/bin/grok-bot-headless" help >/dev/null
 check_output="$(
   HOME="$home_dir" \
   GROK_BOT_BINARY="$fake_dir/grok-bot" \
-  GROK_BOT_DAEMON_SCRIPT="$fake_dir/app.asar/dist/local-exec-daemon/main.cjs" \
+  GROK_BOT_DAEMON_SCRIPT="$fake_dir/resources/app.asar/dist/local-exec-daemon/main.cjs" \
   SAND_CLIENT_APP_VERSION="99.0.0" \
     "$home_dir/.local/bin/grok-bot-headless" check --local
 )"
@@ -70,7 +70,7 @@ header.writeUInt32LE(4, 0);
 header.writeUInt32LE(json.length + 8, 4);
 header.writeUInt32LE(json.length + 4, 8);
 header.writeUInt32LE(json.length, 12);
-writeFileSync(process.argv[1], Buffer.concat([header, json, Buffer.from('{"version":"0.66.0"}\n')]));
+writeFileSync(process.argv[2], Buffer.concat([header, json, Buffer.from('{"version":"0.66.0"}\n')]));
 JS
 if HOME="$home_dir" \
   GROK_BOT_BINARY="$fake_dir/grok-bot" \
