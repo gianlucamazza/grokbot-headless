@@ -1,6 +1,18 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { closeSync, mkdtempSync, openSync, readSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import {
+  closeSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  openSync,
+  readFileSync,
+  readlinkSync,
+  readSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
@@ -10,14 +22,47 @@ import {
   accountScope,
   base64url,
   cursorChecksum,
+  daemonLaunchEnv,
   hasCredentialShape,
   isTestedClientVersion,
   jwtPayload,
+  prepareDaemonLaunch,
   resolveDaemonEntry,
+  spawnDaemon,
   syncMachinePolicy,
   tokenExpiresSoon,
   validatedServiceUrl,
 } from '../grok-bot-headless.mjs';
+
+const DISCOVERY_WRITER = `
+const fs = require('node:fs');
+const path = require('node:path');
+process.on('message', (bootstrap) => {
+  const { ELECTRON_RUN_AS_NODE, SAND_PACKAGED, SAND_DATA_ROOT, SAND_CLIENT_APP_VERSION } = process.env;
+  fs.writeFileSync(
+    path.join(process.env.SAND_DATA_ROOT, 'local-exec-daemon.json'),
+    JSON.stringify({
+      pid: process.pid,
+      bootstrap,
+      execPath: process.execPath,
+      script: process.argv[1],
+      env: { ELECTRON_RUN_AS_NODE, SAND_PACKAGED, SAND_DATA_ROOT, SAND_CLIENT_APP_VERSION },
+    }),
+  );
+});
+process.on('SIGTERM', () => process.exit(0));
+setInterval(() => {}, 1000);
+`;
+
+async function waitFor(probe, description, timeoutMs = 10_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const value = await probe();
+    if (value) return value;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  throw new Error(`Timed out waiting for ${description}`);
+}
 
 function writeAsar(archivePath, files) {
   const tree = { files: {} };
@@ -212,6 +257,72 @@ test('0.66.0 version payload that starts with > then { still parses', () => {
       authentication: 'skipped',
     });
   } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('asar extract loads dist/local-exec-daemon/main.cjs for system node', () => {
+  const directory = mkdtempSync(join(tmpdir(), 'grok-bot-066-extract-'));
+  try {
+    const archive = join(directory, 'app.asar');
+    const daemonEntry = 'dist/local-exec-daemon/main.cjs';
+    const unpackedDeps = join(directory, 'app.asar.unpacked', 'dist', 'deps');
+    mkdirSync(unpackedDeps, { recursive: true });
+    writeFileSync(join(unpackedDeps, 'marker'), 'natives\n');
+    writeAsar(archive, {
+      'package.json': '{"version":"0.66.0"}\n',
+      [daemonEntry]: DISCOVERY_WRITER,
+    });
+    const extractRoot = join(directory, 'extracted-client');
+    const script = prepareDaemonLaunch(`${archive}/${daemonEntry}`, extractRoot);
+    assert.equal(script, join(extractRoot, daemonEntry));
+    assert.equal(readFileSync(script, 'utf8'), DISCOVERY_WRITER);
+    assert.equal(readlinkSync(join(extractRoot, 'dist', 'deps')), unpackedDeps);
+    assert.equal(resolveDaemonEntry(`${archive}/${daemonEntry}`), daemonEntry);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('system-node child keeps SAND_* and writes local-exec-daemon.json', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'grok-bot-066-launch-'));
+  const dataRoot = join(directory, 'data');
+  mkdirSync(dataRoot, { recursive: true, mode: 0o700 });
+  const discovery = join(dataRoot, 'local-exec-daemon.json');
+  let child;
+  try {
+    const archive = join(directory, 'app.asar');
+    const daemonEntry = 'dist/local-exec-daemon/main.cjs';
+    writeAsar(archive, { [daemonEntry]: DISCOVERY_WRITER });
+    const script = prepareDaemonLaunch(`${archive}/${daemonEntry}`, join(directory, 'extracted-client'));
+    assert.equal(existsSync(discovery), false, 'controller must not write discovery before spawn');
+    child = spawnDaemon('machine-launch-1', {
+      script,
+      env: daemonLaunchEnv({ dataRoot, clientAppVersion: '0.66.0' }),
+      stdio: ['ignore', 'ignore', 'ignore', 'ipc'],
+    });
+    assert.equal(child.spawnfile, process.execPath);
+    const record = await waitFor(
+      () => existsSync(discovery) && JSON.parse(readFileSync(discovery, 'utf8')),
+      'child-written discovery',
+    );
+    assert.equal(record.pid, child.pid);
+    assert.equal(record.execPath, process.execPath);
+    assert.equal(record.script, script);
+    assert.deepEqual(record.bootstrap, {
+      type: 'sand-local-exec-file-key',
+      key: null,
+      computerId: 'machine-launch-1',
+    });
+    assert.deepEqual(record.env, {
+      SAND_PACKAGED: '1',
+      SAND_DATA_ROOT: dataRoot,
+      SAND_CLIENT_APP_VERSION: '0.66.0',
+    });
+    assert.equal(Object.hasOwn(record.env, 'ELECTRON_RUN_AS_NODE'), false);
+    assert.notEqual(record.pid, process.pid, 'discovery pid must be the child, not the controller');
+  } finally {
+    if (child && child.exitCode === null && child.signalCode === null) child.kill('SIGTERM');
     rmSync(directory, { recursive: true, force: true });
   }
 });

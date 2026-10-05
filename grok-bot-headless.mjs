@@ -1,7 +1,21 @@
 #!/usr/bin/env node
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { execFileSync, fork } from 'node:child_process';
-import { closeSync, openSync, readFileSync, readSync, realpathSync } from 'node:fs';
+import {
+  closeSync,
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  readlinkSync,
+  readSync,
+  realpathSync,
+  renameSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from 'node:fs';
 import { access, chmod, mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import { createRequire } from 'node:module';
 import { homedir, hostname } from 'node:os';
@@ -303,17 +317,57 @@ async function assertAppInstalled() {
   }
 }
 
-function spawnDaemon(machineId) {
-  const child = fork(DAEMON_SCRIPT, [], {
-    execPath: APP_BINARY,
-    env: {
-      ...process.env,
-      ELECTRON_RUN_AS_NODE: '1',
-      SAND_PACKAGED: '1',
-      SAND_DATA_ROOT: DATA_ROOT,
-      SAND_CLIENT_APP_VERSION: clientVersion(),
-    },
-    stdio: ['ignore', 'inherit', 'inherit', 'ipc'],
+function writeExtractedFile(path, bytes) {
+  mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+  const temporary = `${path}.${process.pid}.tmp`;
+  writeFileSync(temporary, bytes, { mode: 0o600 });
+  renameSync(temporary, path);
+}
+
+function ensureSymlink(target, dest) {
+  mkdirSync(dirname(dest), { recursive: true, mode: 0o700 });
+  try {
+    if (lstatSync(dest).isSymbolicLink() && readlinkSync(dest) === target) return dest;
+    rmSync(dest, { recursive: true, force: true });
+  } catch (error) {
+    if (error?.code !== 'ENOENT') throw error;
+  }
+  symlinkSync(target, dest);
+  return dest;
+}
+
+function unpackedDepsPath(archive) {
+  return `${archive}.unpacked/dist/deps`;
+}
+
+function prepareDaemonLaunch(script = DAEMON_SCRIPT, extractRoot = join(DATA_ROOT, 'extracted-client')) {
+  const virtual = asarVirtualPath(script);
+  if (!virtual) return localRequire.resolve(script);
+  resolveDaemonEntry(script);
+  const dest = join(extractRoot, virtual.entry);
+  writeExtractedFile(dest, readAsarFile(virtual.archive, virtual.entry));
+  const unpackedDeps = unpackedDepsPath(virtual.archive);
+  if (existsSync(unpackedDeps)) ensureSymlink(unpackedDeps, join(extractRoot, 'dist', 'deps'));
+  return dest;
+}
+
+function daemonLaunchEnv({ dataRoot = DATA_ROOT, clientAppVersion = clientVersion() } = {}) {
+  const env = {
+    ...process.env,
+    SAND_PACKAGED: '1',
+    SAND_DATA_ROOT: dataRoot,
+    SAND_CLIENT_APP_VERSION: clientAppVersion,
+  };
+  delete env.ELECTRON_RUN_AS_NODE;
+  return env;
+}
+
+function spawnDaemon(machineId, options = {}) {
+  const script = options.script ?? prepareDaemonLaunch(options.daemonScript, options.extractRoot);
+  const child = fork(script, [], {
+    execPath: process.execPath,
+    env: options.env ?? daemonLaunchEnv(options),
+    stdio: options.stdio ?? ['ignore', 'inherit', 'inherit', 'ipc'],
   });
   child.once('spawn', () => {
     child.send({ type: 'sand-local-exec-file-key', key: null, computerId: machineId });
@@ -635,10 +689,13 @@ export {
   accountScope,
   base64url,
   cursorChecksum,
+  daemonLaunchEnv,
   hasCredentialShape,
   isTestedClientVersion,
   jwtPayload,
+  prepareDaemonLaunch,
   resolveDaemonEntry,
+  spawnDaemon,
   tokenExpiresSoon,
   syncMachinePolicy,
   validatedServiceUrl,
