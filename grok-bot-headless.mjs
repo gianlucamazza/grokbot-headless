@@ -1,11 +1,14 @@
 #!/usr/bin/env node
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { execFileSync, fork } from 'node:child_process';
-import { realpathSync } from 'node:fs';
+import { closeSync, openSync, readFileSync, readSync, realpathSync } from 'node:fs';
 import { access, chmod, mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
+import { createRequire } from 'node:module';
 import { homedir, hostname } from 'node:os';
 import { dirname, join } from 'node:path';
 import { pathToFileURL } from 'node:url';
+
+const localRequire = createRequire(import.meta.url);
 
 // --- Configuration -----------------------------------------------------------
 
@@ -29,12 +32,13 @@ const HEARTBEAT_PATH = join(DATA_ROOT, 'local-exec-supervisor.json');
 const DISCOVERY_PATH = join(DATA_ROOT, 'local-exec-daemon.json');
 const SETTINGS_PATH = join(DATA_ROOT, 'settings.json');
 const APP_BINARY = process.env.GROK_BOT_BINARY || '/opt/Grok Bot/grok-bot';
-const DAEMON_SCRIPT = process.env.GROK_BOT_DAEMON_SCRIPT || '/opt/Grok Bot/resources/app.asar/dist/local-exec-daemon/main.cjs';
+const DAEMON_ENTRY_POINT = 'dist/local-exec-daemon/main.cjs';
+const DAEMON_SCRIPT = process.env.GROK_BOT_DAEMON_SCRIPT || join(dirname(APP_BINARY), 'resources', 'app.asar', DAEMON_ENTRY_POINT);
 const DAEMON_CONTAINER_PATH = DAEMON_SCRIPT.includes('.asar/')
   ? `${DAEMON_SCRIPT.slice(0, DAEMON_SCRIPT.indexOf('.asar/'))}.asar`
   : DAEMON_SCRIPT;
 const PACKAGE_JSON_PATH = process.env.GROK_BOT_PACKAGE_JSON || join(dirname(APP_BINARY), 'resources', 'app.asar', 'package.json');
-const TESTED_CLIENT_VERSIONS = Object.freeze(['0.30.0']);
+const TESTED_CLIENT_VERSIONS = Object.freeze(['0.30.0', '0.66.0']);
 const POLICIES = Object.freeze(['always', 'ask', 'never']);
 const TOKEN_REFRESH_MARGIN_MS = 5 * 60 * 1000;
 const DESCRIPTOR_REFRESH_MS = 60 * 1000;
@@ -197,11 +201,83 @@ function appNode(code) {
   });
 }
 
+function asarVirtualPath(path) {
+  const marker = '.asar/';
+  const index = path.indexOf(marker);
+  if (index === -1) return null;
+  return { archive: `${path.slice(0, index)}.asar`, entry: path.slice(index + marker.length) };
+}
+
+function readExact(fd, length, position) {
+  const buffer = Buffer.alloc(length);
+  let offset = 0;
+  while (offset < length) {
+    const bytes = readSync(fd, buffer, offset, length - offset, position + offset);
+    if (bytes === 0) throw new Error('Unexpected end of asar archive');
+    offset += bytes;
+  }
+  return buffer;
+}
+
+function loadAsarHeader(archive) {
+  const fd = openSync(archive, 'r');
+  try {
+    const jsonSize = readExact(fd, 16, 0).readUInt32LE(12);
+    return { fd, jsonSize, header: JSON.parse(readExact(fd, jsonSize, 16)) };
+  } catch (error) {
+    closeSync(fd);
+    throw error;
+  }
+}
+
+function asarLookup(header, entry) {
+  let node = header;
+  for (const part of entry.split('/').filter(Boolean)) {
+    node = node?.files?.[part];
+    if (!node) return null;
+  }
+  return node && !node.files ? node : null;
+}
+
+function readAsarFile(archive, entry) {
+  const { fd, jsonSize, header } = loadAsarHeader(archive);
+  try {
+    const node = asarLookup(header, entry);
+    if (!node || typeof node.size !== 'number') throw new Error(`Cannot resolve ${entry}`);
+    return readExact(fd, node.size, 16 + jsonSize + Number(node.offset));
+  } finally {
+    closeSync(fd);
+  }
+}
+
+function readPackageVersion(path) {
+  const virtual = asarVirtualPath(path);
+  const source = virtual ? readAsarFile(virtual.archive, virtual.entry) : readFileSync(path);
+  const version = JSON.parse(source.toString('utf8')).version;
+  return typeof version === 'string' && version.trim() ? version.trim() : null;
+}
+
+function resolveDaemonEntry(script = DAEMON_SCRIPT) {
+  const virtual = asarVirtualPath(script);
+  if (virtual) {
+    const { fd, header } = loadAsarHeader(virtual.archive);
+    try {
+      if (!asarLookup(header, virtual.entry)) {
+        throw new Error(`Cannot resolve daemon entry point: ${virtual.entry}`);
+      }
+    } finally {
+      closeSync(fd);
+    }
+    return virtual.entry;
+  }
+  return localRequire.resolve(script);
+}
+
 let installedVersionCache;
 function installedVersion() {
   if (installedVersionCache === undefined) {
     try {
-      installedVersionCache = appNode(`process.stdout.write(require(${JSON.stringify(PACKAGE_JSON_PATH)}).version)`).trim() || null;
+      installedVersionCache = readPackageVersion(PACKAGE_JSON_PATH);
     } catch {
       installedVersionCache = null;
     }
@@ -214,7 +290,7 @@ function clientVersion() {
 }
 
 function probeDaemonEntry() {
-  appNode(`require.resolve(${JSON.stringify(DAEMON_SCRIPT)})`);
+  resolveDaemonEntry();
 }
 
 async function assertAppInstalled() {
@@ -560,6 +636,7 @@ export {
   hasCredentialShape,
   isTestedClientVersion,
   jwtPayload,
+  resolveDaemonEntry,
   tokenExpiresSoon,
   syncMachinePolicy,
   validatedServiceUrl,
