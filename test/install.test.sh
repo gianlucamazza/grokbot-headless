@@ -40,11 +40,28 @@ header.writeUInt32LE(json.length, 12);
 writeFileSync(archive, Buffer.concat([header, json, ...blobs]));
 JS
 
-HOME="$home_dir" \
-USER=testuser \
-PATH="$shim_dir:$PATH" \
-GROK_BOT_BINARY="$fake_dir/grok-bot" \
-GROK_BOT_DAEMON_SCRIPT="$fake_dir/resources/app.asar/dist/local-exec-daemon/main.cjs" \
+node_bin="$(command -v node)"
+node_dir="$(dirname -- "$node_bin")"
+environment_file="$home_dir/.config/grok-bot-headless/environment"
+env_value() {
+  local key="$1" line value
+  line="$(grep -E "^${key}=" "$environment_file" | tail -n 1)"
+  [[ -n "$line" ]]
+  value="${line#*=}"
+  if [[ "$value" == \"*\" ]]; then
+    value="${value:1:${#value}-2}"
+    value="${value//\\\"/\"}"
+    value="${value//\\\\/\\}"
+  fi
+  printf '%s' "$value"
+}
+
+env -u DISPLAY \
+  HOME="$home_dir" \
+  USER=testuser \
+  PATH="$shim_dir:$PATH" \
+  GROK_BOT_BINARY="$fake_dir/grok-bot" \
+  GROK_BOT_DAEMON_SCRIPT="$fake_dir/resources/app.asar/dist/local-exec-daemon/main.cjs" \
   "$repo_dir/install.sh"
 
 test -x "$home_dir/.local/bin/grok-bot-headless"
@@ -52,6 +69,24 @@ test -x "$home_dir/.local/lib/grok-bot-headless/grok-bot-headless.mjs"
 test -f "$home_dir/.config/systemd/user/grok-bot-headless.service"
 test "$(stat -c '%a' "$home_dir/.config/grok-bot-headless/environment")" = 600
 test "$(stat -c '%a' "$home_dir/.config/grok-bot-headless")" = 700
+written_path="$(env_value PATH)"
+written_display="$(env_value DISPLAY)"
+[[ "$written_display" == ":99" ]]
+[[ ":$written_path:" == *":$node_dir:"* ]]
+resolved_node="$(env -i PATH="$written_path" node -p 'process.execPath')"
+[[ -n "$resolved_node" ]]
+[[ -x "$resolved_node" ]]
+
+DISPLAY=":7" \
+HOME="$home_dir" \
+USER=testuser \
+PATH="$shim_dir:$PATH" \
+GROK_BOT_BINARY="$fake_dir/grok-bot" \
+GROK_BOT_DAEMON_SCRIPT="$fake_dir/resources/app.asar/dist/local-exec-daemon/main.cjs" \
+  "$repo_dir/install.sh"
+[[ "$(env_value DISPLAY)" == ":7" ]]
+written_path="$(env_value PATH)"
+[[ -n "$(env -i PATH="$written_path" node -p 'process.execPath')" ]]
 HOME="$home_dir" "$home_dir/.local/bin/grok-bot-headless" help >/dev/null
 check_output="$(
   HOME="$home_dir" \

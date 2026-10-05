@@ -153,6 +153,8 @@ The installer enables the user service. To let the user service start during boo
 sudo loginctl enable-linger "$USER"
 ```
 
+A lingered user service does not inherit a login `PATH` or `DISPLAY`. The installer writes both into `~/.config/grok-bot-headless/environment` so `node` still resolves and an existing display stays available. If `DISPLAY` is unset at install time, the file uses `:99`.
+
 ## Execution policy
 
 The policy controls how the official daemon handles local tool requests. The command registers the machine and synchronizes the same policy with the backend machine roster. Run it once after `login` and before the first service start. It is the only command that registers the machine.
@@ -345,7 +347,7 @@ GROK_BOT_DAEMON_SCRIPT=/path/to/local-exec-daemon/main.cjs \
 ./install.sh
 ```
 
-The installer saves these paths in:
+The installer saves these paths, the install-time `PATH`, and `DISPLAY` in:
 
 ```text
 ~/.config/grok-bot-headless/environment
@@ -426,6 +428,10 @@ grok-bot-headless check
 ```
 
 If authentication has expired, run `grok-bot-headless login` again.
+
+### `exec: node: not found`
+
+The systemd user service runs `~/.local/bin/grok-bot-headless`, which starts with `exec node`. Re-run `./install.sh` so the environment file contains the `PATH` that locates `node`.
 
 ### The service does not start during boot
 
